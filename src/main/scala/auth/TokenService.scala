@@ -6,51 +6,62 @@ import com.nimbusds.jwt.{ JWTClaimsSet, SignedJWT }
 import org.joda.time.{ DateTime, DateTimeZone }
 import org.slf4j.LoggerFactory
 
+import scala.concurrent.{ ExecutionContext, Future }
 import scala.util.control.NonFatal
 
 trait TokenService {
 
-  def issueToken(params: TokenParams): Token
+  def issueToken(params: TokenParams, tokenType: String): Future[Either[GenericTokenError, Token]]
 
-  def verifyToken(token: String): Either[TokenError, Token]
+  def verifyToken(token: String, tokenType: String): Future[Either[TokenError, Token]]
+
+  def removeToken(token: String, tokenType: String): Future[Either[IllegalStateException, Boolean]]
 }
 
-class TokenServiceImpl(signingKey: Array[Byte]) extends TokenService {
+class TokenServiceImpl(signingKey: Array[Byte], storage: TokenStorage)(implicit ec: ExecutionContext) extends TokenService {
   private val log = LoggerFactory.getLogger(getClass)
   private val signer = new MACSigner(signingKey)
   private val verifier = new MACVerifier(signingKey)
 
-  override def issueToken(params: TokenParams): Token = {
-    val now: DateTime = DateTime.now(DateTimeZone.UTC).withMillisOfSecond(0)
-    val id = java.util.UUID.randomUUID().toString.replaceAll("-", "")
-    val expiresAt = params.lifetime.map(seconds => now.plus(seconds))
+  override def issueToken(params: TokenParams, tokenType: String): Future[Either[GenericTokenError, Token]] = {
+    try {
+      val now: DateTime = DateTime.now(DateTimeZone.UTC).withMillisOfSecond(0)
+      val id = java.util.UUID.randomUUID().toString.replaceAll("-", "")
+      val expiresAt = params.lifetime.map(seconds => now.plus(seconds))
 
-    val claims = new JWTClaimsSet {
-      setIssueTime(now.toDate)
-      setJWTID(id)
-      setSubject(params.userId)
-      expiresAt.map(date => setExpirationTime(date.toDate))
+      val claims = new JWTClaimsSet {
+        setIssueTime(now.toDate)
+        setJWTID(id)
+        setSubject(params.userId)
+        expiresAt.map(date => setExpirationTime(date.toDate))
 
+      }
+
+      val signed = new SignedJWT(new JWSHeader(JWSAlgorithm.HS256), claims)
+      signed.sign(signer)
+
+      val serialized = signed.serialize()
+      val token = Token(
+        id = id,
+        userId = params.userId,
+        issuedAt = now.toString(),
+        expiresAt = expiresAt.map(_.toString()),
+        serialized = serialized
+      )
+
+      storage.addToken(token.serialized, tokenType).map {
+        case true  => Right(token)
+        case false => Left(GenericTokenError(s"Could not insert token into storage: storage : $this"))
+      }
+    } catch {
+      case NonFatal(e) => Future.successful(Left(GenericTokenError(e.getMessage)))
     }
-
-    val signed = new SignedJWT(new JWSHeader(JWSAlgorithm.HS256), claims)
-    signed.sign(signer)
-
-    val serialized = signed.serialize()
-
-    Token(
-      id = id,
-      userId = params.userId,
-      issuedAt = now.toString(),
-      expiresAt = expiresAt.map(_.toString()),
-      serialized = serialized
-    )
   }
 
-  override def verifyToken(serializedToken: String): Either[TokenError, Token] = {
+  override def verifyToken(serializedToken: String, tokenType: String): Future[Either[TokenError, Token]] = {
     try {
       val parsed = SignedJWT.parse(serializedToken)
-      if (parsed.verify(verifier)) {
+      val result = if (parsed.verify(verifier)) {
         Option(parsed.getJWTClaimsSet.getIssueTime) match {
           case None => Left(InvalidToken(serializedToken, "No issued time set on token"))
           case Some(iat) =>
@@ -83,23 +94,33 @@ class TokenServiceImpl(signingKey: Array[Byte]) extends TokenService {
                           )
                         }
                     }
-
                 }
-
             }
-
         }
       } else {
         //not verified
-
         Left(InvalidToken(serializedToken, "Invalid token"))
+      }
+
+      result match {
+        case p @ Left(_) =>
+          Future.successful(p)
+        case Right(parsedToken) =>
+          storage.exists(parsedToken.serialized, tokenType).map {
+            case true =>
+              Right(parsedToken)
+            case false =>
+              Left(TokenNotExistent(parsedToken.serialized, s"Token is not in storage : storage :$this"))
+          }
       }
 
     } catch {
       case NonFatal(e) =>
         log.error("error occured while verifying token", e)
-        Left(InvalidToken(serializedToken, "Invalid token"))
+        Future.successful(Left(InvalidToken(serializedToken, "Invalid token")))
     }
-
   }
+
+  override def removeToken(token: String, tokenType: String): Future[Either[IllegalStateException, Boolean]] =
+    storage.removeToken(token, tokenType)
 }
